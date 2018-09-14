@@ -32,9 +32,10 @@ import (
 	"k8s.io/kubernetes/pkg/security/apparmor"
 	"k8s.io/kubernetes/pkg/security/podsecuritypolicy/seccomp"
 	psputil "k8s.io/kubernetes/pkg/security/podsecuritypolicy/util"
-	utilpointer "k8s.io/kubernetes/pkg/util/pointer"
 	"k8s.io/kubernetes/test/e2e/common"
 	"k8s.io/kubernetes/test/e2e/framework"
+	imageutils "k8s.io/kubernetes/test/utils/image"
+	utilpointer "k8s.io/utils/pointer"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -74,7 +75,7 @@ var _ = SIGDescribe("PodSecurityPolicy", func() {
 
 	It("should forbid pod creation when no PSP is available", func() {
 		By("Running a restricted pod")
-		_, err := c.CoreV1().Pods(ns).Create(restrictedPod(f, "restricted"))
+		_, err := c.CoreV1().Pods(ns).Create(restrictedPod("restricted"))
 		expectForbidden(err)
 	})
 
@@ -86,11 +87,11 @@ var _ = SIGDescribe("PodSecurityPolicy", func() {
 		defer cleanup()
 
 		By("Running a restricted pod")
-		pod, err := c.CoreV1().Pods(ns).Create(restrictedPod(f, "allowed"))
+		pod, err := c.CoreV1().Pods(ns).Create(restrictedPod("allowed"))
 		framework.ExpectNoError(err)
 		framework.ExpectNoError(framework.WaitForPodNameRunningInNamespace(c, pod.Name, pod.Namespace))
 
-		testPrivilegedPods(f, func(pod *v1.Pod) {
+		testPrivilegedPods(func(pod *v1.Pod) {
 			_, err := c.CoreV1().Pods(ns).Create(pod)
 			expectForbidden(err)
 		})
@@ -102,11 +103,11 @@ var _ = SIGDescribe("PodSecurityPolicy", func() {
 		defer cleanup()
 
 		By("Running a restricted pod")
-		pod, err := c.CoreV1().Pods(ns).Create(restrictedPod(f, "allowed"))
+		pod, err := c.CoreV1().Pods(ns).Create(restrictedPod("allowed"))
 		framework.ExpectNoError(err)
 		framework.ExpectNoError(framework.WaitForPodNameRunningInNamespace(c, pod.Name, pod.Namespace))
 
-		testPrivilegedPods(f, func(pod *v1.Pod) {
+		testPrivilegedPods(func(pod *v1.Pod) {
 			_, err := c.CoreV1().Pods(ns).Create(pod)
 			expectForbidden(err)
 		})
@@ -120,7 +121,7 @@ var _ = SIGDescribe("PodSecurityPolicy", func() {
 		expectedPSP, cleanup := createAndBindPSP(f, framework.PrivilegedPSP("permissive"))
 		defer cleanup()
 
-		testPrivilegedPods(f, func(pod *v1.Pod) {
+		testPrivilegedPods(func(pod *v1.Pod) {
 			p, err := c.CoreV1().Pods(ns).Create(pod)
 			framework.ExpectNoError(err)
 			framework.ExpectNoError(framework.WaitForPodNameRunningInNamespace(c, p.Name, p.Namespace))
@@ -142,7 +143,7 @@ var _ = SIGDescribe("PodSecurityPolicy", func() {
 		expectedPSP, cleanup := createAndBindPSPInPolicy(f, privilegedPSPInPolicy("permissive"))
 		defer cleanup()
 
-		testPrivilegedPods(f, func(pod *v1.Pod) {
+		testPrivilegedPods(func(pod *v1.Pod) {
 			p, err := c.CoreV1().Pods(ns).Create(pod)
 			framework.ExpectNoError(err)
 			framework.ExpectNoError(framework.WaitForPodNameRunningInNamespace(c, p.Name, p.Namespace))
@@ -162,16 +163,16 @@ func expectForbidden(err error) {
 	Expect(apierrs.IsForbidden(err)).To(BeTrue(), "should be forbidden error")
 }
 
-func testPrivilegedPods(f *framework.Framework, tester func(pod *v1.Pod)) {
+func testPrivilegedPods(tester func(pod *v1.Pod)) {
 	By("Running a privileged pod", func() {
-		privileged := restrictedPod(f, "privileged")
+		privileged := restrictedPod("privileged")
 		privileged.Spec.Containers[0].SecurityContext.Privileged = boolPtr(true)
 		privileged.Spec.Containers[0].SecurityContext.AllowPrivilegeEscalation = nil
 		tester(privileged)
 	})
 
 	By("Running a HostPath pod", func() {
-		hostpath := restrictedPod(f, "hostpath")
+		hostpath := restrictedPod("hostpath")
 		hostpath.Spec.Containers[0].VolumeMounts = []v1.VolumeMount{{
 			Name:      "hp",
 			MountPath: "/hp",
@@ -186,26 +187,26 @@ func testPrivilegedPods(f *framework.Framework, tester func(pod *v1.Pod)) {
 	})
 
 	By("Running a HostNetwork pod", func() {
-		hostnet := restrictedPod(f, "hostnet")
+		hostnet := restrictedPod("hostnet")
 		hostnet.Spec.HostNetwork = true
 		tester(hostnet)
 	})
 
 	By("Running a HostPID pod", func() {
-		hostpid := restrictedPod(f, "hostpid")
+		hostpid := restrictedPod("hostpid")
 		hostpid.Spec.HostPID = true
 		tester(hostpid)
 	})
 
 	By("Running a HostIPC pod", func() {
-		hostipc := restrictedPod(f, "hostipc")
+		hostipc := restrictedPod("hostipc")
 		hostipc.Spec.HostIPC = true
 		tester(hostipc)
 	})
 
 	if common.IsAppArmorSupported() {
 		By("Running a custom AppArmor profile pod", func() {
-			aa := restrictedPod(f, "apparmor")
+			aa := restrictedPod("apparmor")
 			// Every node is expected to have the docker-default profile.
 			aa.Annotations[apparmor.ContainerAnnotationKeyPrefix+"pause"] = "localhost/docker-default"
 			tester(aa)
@@ -213,13 +214,13 @@ func testPrivilegedPods(f *framework.Framework, tester func(pod *v1.Pod)) {
 	}
 
 	By("Running an unconfined Seccomp pod", func() {
-		unconfined := restrictedPod(f, "seccomp")
+		unconfined := restrictedPod("seccomp")
 		unconfined.Annotations[v1.SeccompPodAnnotationKey] = "unconfined"
 		tester(unconfined)
 	})
 
 	By("Running a SYS_ADMIN pod", func() {
-		sysadmin := restrictedPod(f, "sysadmin")
+		sysadmin := restrictedPod("sysadmin")
 		sysadmin.Spec.Containers[0].SecurityContext.Capabilities = &v1.Capabilities{
 			Add: []v1.Capability{"SYS_ADMIN"},
 		}
@@ -310,22 +311,22 @@ func createAndBindPSPInPolicy(f *framework.Framework, pspTemplate *policy.PodSec
 	}
 }
 
-func restrictedPod(f *framework.Framework, name string) *v1.Pod {
+func restrictedPod(name string) *v1.Pod {
 	return &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 			Annotations: map[string]string{
-				v1.SeccompPodAnnotationKey:                      "docker/default",
+				v1.SeccompPodAnnotationKey:                      v1.SeccompProfileRuntimeDefault,
 				apparmor.ContainerAnnotationKeyPrefix + "pause": apparmor.ProfileRuntimeDefault,
 			},
 		},
 		Spec: v1.PodSpec{
 			Containers: []v1.Container{{
 				Name:  "pause",
-				Image: framework.GetPauseImageName(f.ClientSet),
+				Image: imageutils.GetPauseImageName(),
 				SecurityContext: &v1.SecurityContext{
 					AllowPrivilegeEscalation: boolPtr(false),
-					RunAsUser:                intPtr(65534),
+					RunAsUser:                utilpointer.Int64Ptr(65534),
 				},
 			}},
 		},
@@ -373,8 +374,8 @@ func restrictedPSPInPolicy(name string) *policy.PodSecurityPolicy {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 			Annotations: map[string]string{
-				seccomp.AllowedProfilesAnnotationKey:  "docker/default",
-				seccomp.DefaultProfileAnnotationKey:   "docker/default",
+				seccomp.AllowedProfilesAnnotationKey:  v1.SeccompProfileRuntimeDefault,
+				seccomp.DefaultProfileAnnotationKey:   v1.SeccompProfileRuntimeDefault,
 				apparmor.AllowedProfilesAnnotationKey: apparmor.ProfileRuntimeDefault,
 				apparmor.DefaultProfileAnnotationKey:  apparmor.ProfileRuntimeDefault,
 			},
@@ -428,8 +429,8 @@ func restrictedPSP(name string) *extensionsv1beta1.PodSecurityPolicy {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 			Annotations: map[string]string{
-				seccomp.AllowedProfilesAnnotationKey:  "docker/default",
-				seccomp.DefaultProfileAnnotationKey:   "docker/default",
+				seccomp.AllowedProfilesAnnotationKey:  v1.SeccompProfileRuntimeDefault,
+				seccomp.DefaultProfileAnnotationKey:   v1.SeccompProfileRuntimeDefault,
 				apparmor.AllowedProfilesAnnotationKey: apparmor.ProfileRuntimeDefault,
 				apparmor.DefaultProfileAnnotationKey:  apparmor.ProfileRuntimeDefault,
 			},
@@ -479,8 +480,4 @@ func restrictedPSP(name string) *extensionsv1beta1.PodSecurityPolicy {
 
 func boolPtr(b bool) *bool {
 	return &b
-}
-
-func intPtr(i int64) *int64 {
-	return &i
 }

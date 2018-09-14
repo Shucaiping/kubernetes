@@ -25,25 +25,35 @@ import (
 	"path"
 	"testing"
 
+	"reflect"
+
+	"github.com/golang/glog"
 	api "k8s.io/api/core/v1"
 	storage "k8s.io/api/storage/v1beta1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	utilfeaturetesting "k8s.io/apiserver/pkg/util/feature/testing"
 	fakeclient "k8s.io/client-go/kubernetes/fake"
+	csiapi "k8s.io/csi-api/pkg/apis/csi/v1alpha1"
+	fakecsi "k8s.io/csi-api/pkg/client/clientset/versioned/fake"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/volume"
-	"k8s.io/kubernetes/pkg/volume/csi/fake"
-	volumetest "k8s.io/kubernetes/pkg/volume/testing"
+	"k8s.io/kubernetes/pkg/volume/util"
 )
 
 var (
-	testDriver = "test-driver"
-	testVol    = "vol-123"
-	testns     = "test-ns"
-	testPodUID = types.UID("test-pod")
+	testDriver  = "test-driver"
+	testVol     = "vol-123"
+	testns      = "test-ns"
+	testPod     = "test-pod"
+	testPodUID  = types.UID("test-pod")
+	testAccount = "test-service-account"
 )
 
 func TestMounterGetPath(t *testing.T) {
-	plug, tmpDir := newTestPlugin(t)
+	plug, tmpDir := newTestPlugin(t, nil, nil)
 	defer os.RemoveAll(tmpDir)
 
 	// TODO (vladimirvivien) specName with slashes will not work
@@ -78,7 +88,6 @@ func TestMounterGetPath(t *testing.T) {
 		csiMounter := mounter.(*csiMountMgr)
 
 		path := csiMounter.GetPath()
-		t.Logf("*** GetPath: %s", path)
 
 		if tc.path != path {
 			t.Errorf("expecting path %s, got %s", tc.path, path)
@@ -86,85 +95,202 @@ func TestMounterGetPath(t *testing.T) {
 	}
 }
 
-func TestMounterSetUp(t *testing.T) {
-	plug, tmpDir := newTestPlugin(t)
-	defer os.RemoveAll(tmpDir)
-	fakeClient := fakeclient.NewSimpleClientset()
-	host := volumetest.NewFakeVolumeHostWithNodeName(
-		tmpDir,
-		fakeClient,
-		nil,
-		"fakeNode",
-	)
-	plug.host = host
-	pv := makeTestPV("test-pv", 10, testDriver, testVol)
-	pvName := pv.GetName()
+func MounterSetUpTests(t *testing.T, podInfoEnabled bool) {
+	defer utilfeaturetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIDriverRegistry, podInfoEnabled)()
+	tests := []struct {
+		name       string
+		driver     string
+		attributes map[string]string
 
-	mounter, err := plug.NewMounter(
-		volume.NewSpecFromPersistentVolume(pv, pv.Spec.PersistentVolumeSource.CSI.ReadOnly),
-		&api.Pod{ObjectMeta: meta.ObjectMeta{UID: testPodUID, Namespace: testns}},
-		volume.VolumeOptions{},
-	)
-	if err != nil {
-		t.Fatalf("Failed to make a new Mounter: %v", err)
-	}
-
-	if mounter == nil {
-		t.Fatal("failed to create CSI mounter")
-	}
-
-	csiMounter := mounter.(*csiMountMgr)
-	csiMounter.csiClient = setupClient(t, false)
-
-	attachID := getAttachmentName(csiMounter.volumeID, csiMounter.driverName, string(plug.host.GetNodeName()))
-
-	attachment := &storage.VolumeAttachment{
-		ObjectMeta: meta.ObjectMeta{
-			Name: attachID,
+		expectedAttributes map[string]string
+	}{
+		{
+			name:               "no pod info",
+			driver:             "no-info",
+			attributes:         nil,
+			expectedAttributes: nil,
 		},
-		Spec: storage.VolumeAttachmentSpec{
-			NodeName: "test-node",
-			Attacher: csiPluginName,
-			Source: storage.VolumeAttachmentSource{
-				PersistentVolumeName: &pvName,
-			},
+		{
+			name:               "no CSIDriver -> no pod info",
+			driver:             "unknown-driver",
+			attributes:         nil,
+			expectedAttributes: nil,
 		},
-		Status: storage.VolumeAttachmentStatus{
-			Attached:    false,
-			AttachError: nil,
-			DetachError: nil,
+		{
+			name:               "CSIDriver with PodInfoRequiredOnMount=nil -> no pod info",
+			driver:             "nil",
+			attributes:         nil,
+			expectedAttributes: nil,
+		},
+		{
+			name:               "no pod info -> keep existing attributes",
+			driver:             "no-info",
+			attributes:         map[string]string{"foo": "bar"},
+			expectedAttributes: map[string]string{"foo": "bar"},
+		},
+		{
+			name:               "add pod info",
+			driver:             "info",
+			attributes:         nil,
+			expectedAttributes: map[string]string{"csi.storage.k8s.io/pod.uid": "test-pod", "csi.storage.k8s.io/serviceAccount.name": "test-service-account", "csi.storage.k8s.io/pod.name": "test-pod", "csi.storage.k8s.io/pod.namespace": "test-ns"},
+		},
+		{
+			name:               "add pod info -> keep existing attributes",
+			driver:             "info",
+			attributes:         map[string]string{"foo": "bar"},
+			expectedAttributes: map[string]string{"foo": "bar", "csi.storage.k8s.io/pod.uid": "test-pod", "csi.storage.k8s.io/serviceAccount.name": "test-service-account", "csi.storage.k8s.io/pod.name": "test-pod", "csi.storage.k8s.io/pod.namespace": "test-ns"},
 		},
 	}
-	_, err = csiMounter.k8s.StorageV1beta1().VolumeAttachments().Create(attachment)
-	if err != nil {
-		t.Fatalf("failed to setup VolumeAttachment: %v", err)
-	}
 
-	// Mounter.SetUp()
-	if err := csiMounter.SetUp(nil); err != nil {
-		t.Fatalf("mounter.Setup failed: %v", err)
-	}
-	path := csiMounter.GetPath()
-	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			t.Errorf("SetUp() failed, volume path not created: %s", path)
-		} else {
-			t.Errorf("SetUp() failed: %v", err)
-		}
-	}
+	emptyPodMountInfoVersion := ""
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			glog.Infof("Starting test %s", test.name)
+			fakeClient := fakeclient.NewSimpleClientset()
+			fakeCSIClient := fakecsi.NewSimpleClientset(
+				getCSIDriver("no-info", &emptyPodMountInfoVersion, nil),
+				getCSIDriver("info", &currentPodInfoMountVersion, nil),
+				getCSIDriver("nil", nil, nil),
+			)
+			plug, tmpDir := newTestPlugin(t, fakeClient, fakeCSIClient)
+			defer os.RemoveAll(tmpDir)
 
-	// ensure call went all the way
-	pubs := csiMounter.csiClient.(*csiDriverClient).nodeClient.(*fake.NodeClient).GetNodePublishedVolumes()
-	if pubs[csiMounter.volumeID] != csiMounter.GetPath() {
-		t.Error("csi server may not have received NodePublishVolume call")
+			if utilfeature.DefaultFeatureGate.Enabled(features.CSIDriverRegistry) {
+				// Wait until the informer in CSI volume plugin has all CSIDrivers.
+				wait.PollImmediate(testInformerSyncPeriod, testInformerSyncTimeout, func() (bool, error) {
+					return plug.csiDriverInformer.Informer().HasSynced(), nil
+				})
+			}
+
+			pv := makeTestPV("test-pv", 10, test.driver, testVol)
+			pv.Spec.CSI.VolumeAttributes = test.attributes
+			pvName := pv.GetName()
+
+			mounter, err := plug.NewMounter(
+				volume.NewSpecFromPersistentVolume(pv, pv.Spec.PersistentVolumeSource.CSI.ReadOnly),
+				&api.Pod{
+					ObjectMeta: meta.ObjectMeta{UID: testPodUID, Namespace: testns, Name: testPod},
+					Spec: api.PodSpec{
+						ServiceAccountName: testAccount,
+					},
+				},
+				volume.VolumeOptions{},
+			)
+			if err != nil {
+				t.Fatalf("failed to make a new Mounter: %v", err)
+			}
+
+			if mounter == nil {
+				t.Fatal("failed to create CSI mounter")
+			}
+
+			csiMounter := mounter.(*csiMountMgr)
+			csiMounter.csiClient = setupClient(t, true)
+
+			attachID := getAttachmentName(csiMounter.volumeID, csiMounter.driverName, string(plug.host.GetNodeName()))
+
+			attachment := &storage.VolumeAttachment{
+				ObjectMeta: meta.ObjectMeta{
+					Name: attachID,
+				},
+				Spec: storage.VolumeAttachmentSpec{
+					NodeName: "test-node",
+					Attacher: csiPluginName,
+					Source: storage.VolumeAttachmentSource{
+						PersistentVolumeName: &pvName,
+					},
+				},
+				Status: storage.VolumeAttachmentStatus{
+					Attached:    false,
+					AttachError: nil,
+					DetachError: nil,
+				},
+			}
+			_, err = csiMounter.k8s.StorageV1beta1().VolumeAttachments().Create(attachment)
+			if err != nil {
+				t.Fatalf("failed to setup VolumeAttachment: %v", err)
+			}
+
+			// Mounter.SetUp()
+			fsGroup := int64(2000)
+			if err := csiMounter.SetUp(&fsGroup); err != nil {
+				t.Fatalf("mounter.Setup failed: %v", err)
+			}
+
+			//Test the default value of file system type is not overridden
+			if len(csiMounter.spec.PersistentVolume.Spec.CSI.FSType) != 0 {
+				t.Errorf("default value of file system type was overridden by type %s", csiMounter.spec.PersistentVolume.Spec.CSI.FSType)
+			}
+
+			path := csiMounter.GetPath()
+			if _, err := os.Stat(path); err != nil {
+				if os.IsNotExist(err) {
+					t.Errorf("SetUp() failed, volume path not created: %s", path)
+				} else {
+					t.Errorf("SetUp() failed: %v", err)
+				}
+			}
+
+			// ensure call went all the way
+			pubs := csiMounter.csiClient.(*fakeCsiDriverClient).nodeClient.GetNodePublishedVolumes()
+			vol, ok := pubs[csiMounter.volumeID]
+			if !ok {
+				t.Error("csi server may not have received NodePublishVolume call")
+			}
+			if vol.Path != csiMounter.GetPath() {
+				t.Errorf("csi server expected path %s, got %s", csiMounter.GetPath(), vol.Path)
+			}
+			if podInfoEnabled {
+				if !reflect.DeepEqual(vol.Attributes, test.expectedAttributes) {
+					t.Errorf("csi server expected attributes %+v, got %+v", test.expectedAttributes, vol.Attributes)
+				}
+			} else {
+				// CSIPodInfo feature is disabled, we expect no modifications to attributes.
+				if !reflect.DeepEqual(vol.Attributes, test.attributes) {
+					t.Errorf("csi server expected attributes %+v, got %+v", test.attributes, vol.Attributes)
+				}
+			}
+		})
 	}
 }
 
-func TestUnmounterTeardown(t *testing.T) {
-	plug, tmpDir := newTestPlugin(t)
-	defer os.RemoveAll(tmpDir)
+func TestMounterSetUp(t *testing.T) {
+	t.Run("WithCSIPodInfo", func(t *testing.T) {
+		MounterSetUpTests(t, true)
+	})
+	t.Run("WithoutCSIPodInfo", func(t *testing.T) {
+		MounterSetUpTests(t, false)
+	})
+}
 
+func TestUnmounterTeardown(t *testing.T) {
+	plug, tmpDir := newTestPlugin(t, nil, nil)
+	defer os.RemoveAll(tmpDir)
 	pv := makeTestPV("test-pv", 10, testDriver, testVol)
+
+	// save the data file prior to unmount
+	dir := path.Join(getTargetPath(testPodUID, pv.ObjectMeta.Name, plug.host), "/mount")
+	if err := os.MkdirAll(dir, 0755); err != nil && !os.IsNotExist(err) {
+		t.Errorf("failed to create dir [%s]: %v", dir, err)
+	}
+
+	// do a fake local mount
+	diskMounter := util.NewSafeFormatAndMountFromHost(plug.GetPluginName(), plug.host)
+	if err := diskMounter.FormatAndMount("/fake/device", dir, "testfs", nil); err != nil {
+		t.Errorf("failed to mount dir [%s]: %v", dir, err)
+	}
+
+	if err := saveVolumeData(
+		path.Dir(dir),
+		volDataFileName,
+		map[string]string{
+			volDataKey.specVolID:  pv.ObjectMeta.Name,
+			volDataKey.driverName: testDriver,
+			volDataKey.volHandle:  testVol,
+		},
+	); err != nil {
+		t.Fatalf("failed to save volume data: %v", err)
+	}
 
 	unmounter, err := plug.NewUnmounter(pv.ObjectMeta.Name, testPodUID)
 	if err != nil {
@@ -172,30 +298,14 @@ func TestUnmounterTeardown(t *testing.T) {
 	}
 
 	csiUnmounter := unmounter.(*csiMountMgr)
-	csiUnmounter.csiClient = setupClient(t, false)
-
-	dir := csiUnmounter.GetPath()
-
-	// save the data file prior to unmount
-	if err := os.MkdirAll(dir, 0755); err != nil && !os.IsNotExist(err) {
-		t.Errorf("failed to create dir [%s]: %v", dir, err)
-	}
-	if err := saveVolumeData(
-		plug,
-		testPodUID,
-		"test-pv",
-		map[string]string{volDataKey.specVolID: "test-pv", volDataKey.driverName: "driver", volDataKey.volHandle: "vol-handle"},
-	); err != nil {
-		t.Fatalf("failed to save volume data: %v", err)
-	}
-
+	csiUnmounter.csiClient = setupClient(t, true)
 	err = csiUnmounter.TearDownAt(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// ensure csi client call
-	pubs := csiUnmounter.csiClient.(*csiDriverClient).nodeClient.(*fake.NodeClient).GetNodePublishedVolumes()
+	pubs := csiUnmounter.csiClient.(*fakeCsiDriverClient).nodeClient.GetNodePublishedVolumes()
 	if _, ok := pubs[csiUnmounter.volumeID]; ok {
 		t.Error("csi server may not have received NodeUnpublishVolume call")
 	}
@@ -203,7 +313,7 @@ func TestUnmounterTeardown(t *testing.T) {
 }
 
 func TestSaveVolumeData(t *testing.T) {
-	plug, tmpDir := newTestPlugin(t)
+	plug, tmpDir := newTestPlugin(t, nil, nil)
 	defer os.RemoveAll(tmpDir)
 	testCases := []struct {
 		name       string
@@ -222,7 +332,7 @@ func TestSaveVolumeData(t *testing.T) {
 			t.Errorf("failed to create dir [%s]: %v", mountDir, err)
 		}
 
-		err := saveVolumeData(plug, testPodUID, specVolID, tc.data)
+		err := saveVolumeData(path.Dir(mountDir), volDataFileName, tc.data)
 
 		if !tc.shouldFail && err != nil {
 			t.Errorf("unexpected failure: %v", err)
@@ -247,5 +357,17 @@ func TestSaveVolumeData(t *testing.T) {
 		if string(data) != jsonData.String() {
 			t.Errorf("expecting encoded data %v, got %v", string(data), jsonData)
 		}
+	}
+}
+
+func getCSIDriver(name string, podInfoMountVersion *string, attachable *bool) *csiapi.CSIDriver {
+	return &csiapi.CSIDriver{
+		ObjectMeta: meta.ObjectMeta{
+			Name: name,
+		},
+		Spec: csiapi.CSIDriverSpec{
+			PodInfoOnMountVersion: podInfoMountVersion,
+			AttachRequired:        attachable,
+		},
 	}
 }

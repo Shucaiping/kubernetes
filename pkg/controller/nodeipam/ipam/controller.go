@@ -174,14 +174,15 @@ func (c *Controller) onAdd(node *v1.Node) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	if syncer, ok := c.syncers[node.Name]; !ok {
+	syncer, ok := c.syncers[node.Name]
+	if !ok {
 		syncer = c.newSyncer(node.Name)
 		c.syncers[node.Name] = syncer
 		go syncer.Loop(nil)
 	} else {
 		glog.Warningf("Add for node %q that already exists", node.Name)
-		syncer.Update(node)
 	}
+	syncer.Update(node)
 
 	return nil
 }
@@ -208,7 +209,7 @@ func (c *Controller) onDelete(node *v1.Node) error {
 		syncer.Delete(node)
 		delete(c.syncers, node.Name)
 	} else {
-		glog.Warning("Node %q was already deleted", node.Name)
+		glog.Warningf("Node %q was already deleted", node.Name)
 	}
 
 	return nil
